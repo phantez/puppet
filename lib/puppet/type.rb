@@ -1668,6 +1668,11 @@ class Type
         end
     end
 
+    # returns true if the resource can be combined
+    def combine?
+        provider.class.respond_to?(:install_multiple) and resource.combine?
+    end
+	
     ###############################
     # All of the relationship code.
 

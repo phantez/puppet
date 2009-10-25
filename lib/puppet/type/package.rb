@@ -35,6 +35,9 @@ module Puppet
                 package database for installed version(s), and can select
                 which out of a set of available versions of a package to
                 install if asked."
+        feature :combineable, "Multiple packages can be installed or  
+                uninstalled in one command, rather than requiring one command per  
+                package."
 
         ensurable do
             desc "What state the package should be in.
@@ -277,6 +280,14 @@ module Puppet
             newvalues(:true, :false)
         end
 
+        newparam(:combine, :boolean => true, :required_features => :combineable) do
+            desc "Tells package provider if the package installation have to be
+                perform in a single call by the package manager or if it has to
+                be executed separately."
+
+            newvalues(:true, :false)
+        end
+
         autorequire(:file) do
             autos = []
             [:responsefile, :adminfile].each { |param|
@@ -315,6 +326,11 @@ module Puppet
                 props
             end
         end
+
+        def combine?
+            provider.class.respond_to?(:install_multiple) and self[:combine] == :true and [:present,:latest,:installed].include?(self[:ensure])
+        end
+            
     end # Puppet::Type.type(:package)
 end
 

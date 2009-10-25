@@ -2,6 +2,7 @@ Puppet::Type.type(:package).provide :yum, :parent => :rpm, :source => :rpm do
     desc "Support via ``yum``."
 
     has_feature :versionable
+    has_feature :combineable
 
     commands :yum => "yum", :rpm => "rpm", :python => "python"
 
@@ -104,5 +105,23 @@ Puppet::Type.type(:package).provide :yum, :parent => :rpm, :source => :rpm do
     def purge
         yum "-y", :erase, @resource[:name]
     end
- end
 
+    # Static function that enables multiple package to be install at the same time
+    # it returns the resources that haven't been installed correctly
+    def self.install_multiple(resources)
+
+        # check which resource is not installed
+        begin
+            # collect the names of all the resources that need to be installed
+            resources_name = resources.collect{ |r| r[:name]}
+
+            # install package
+            output = yum "-d", "0", "-e", "0", "-y", :install, resources_name
+
+            # resources that have not been installed
+            resources.reject { |r| r.provider.query }
+        rescue Puppet::ExecutionFailure
+            raise Puppet::Error, "Failed to install packages"
+        end
+    end
+ end

@@ -42,6 +42,11 @@ class Transaction
         return true
     end
 
+    # check if all the dependencies have been synced
+    def has_dependencies?(resource)
+        return !relationship_graph.dependencies(resource).empty?
+    end
+
     # Are there any failed resources in this transaction?
     def any_failed?
         failures = @failures.inject(0) { |failures, array| failures += array[1]; failures }
@@ -91,18 +96,22 @@ class Transaction
                 resource.flush
             end
 
-            # And set a trigger for refreshing this resource if it's a
-            # self-refresher
-            if resource.self_refresh? and ! resource.deleting?
-                # Create an edge with this resource as both the source and
-                # target.  The triggering method treats these specially for
-                # logging.
-                events = resourceevents.collect { |e| e.name }
-                set_trigger(Puppet::Relationship.new(resource, resource, :callback => :refresh, :event => events))
-            end
         end
 
+        set_trigger_and_refresh(resource, resourceevents)
         resourceevents
+     end
+  
+     def set_trigger_and_refresh(resource, resourceevents)
+         # And set a trigger for refreshing this resource if it's a
+         # self-refresher
+         if resource.self_refresh? and ! resource.deleting?
+             # Create an edge with this resource as both the source and
+             # target.  The triggering method treats these specially for
+             # logging.
+             events = resourceevents.collect { |e| e.name }
+             set_trigger(Puppet::Relationship.new(resource, resource, :callback => :refresh, :event => events))
+         end
     end
 
     # Apply each change in turn.
@@ -114,7 +123,11 @@ class Transaction
             begin
                 # use an array, so that changes can return more than one
                 # event if they want
-                events = [change.forward].flatten.reject { |e| e.nil? }
+                if resource.combine?
+                    events = evaluate_multiple_resource(resource)
+                else
+                    events = [change.forward].flatten.reject { |e| e.nil? }
+                end
             rescue => detail
                 if Puppet[:trace]
                     puts detail.backtrace
@@ -464,6 +477,125 @@ class Transaction
         end
     end
 
+    # Function that evaluate multiple resource at the same class if they support it.
+    def evaluate_multiple_resource(resource)
+        provider_class = resource.provider.class
+
+        if events = retrieve_combined_resource_events(resource)
+            return events
+        end
+
+        resources = find_combineable_resources(resource)
+        events = evaluate_multiple_resources(resources)
+        set_triggers_from_resource(resources)
+
+        @combine_events[provider_class][resource.name]
+    end
+
+    # retrieves events associated to a specific resource if they exist otherwise return nil
+    def retrieve_combined_resource_events(resource)
+        @combine_events ||= {}
+        @combine_events[resource.provider.class] ||= {}
+        @combine_events[resource.provider.class][resource.name]
+    end
+
+    # Find all resources matching the provider class that set combine
+    def find_combineable_resources(resource)
+
+        # collects the other resources that can be combined with resource
+        resources = catalog.vertices.find_all { |r|
+            r != resource and r.provider.class.equal?(resource.provider.class) and r.combine? and !skip?(r)
+        }
+
+        # rejects the resources that are already synced or couldn't been synced
+        resources.reject! { |r|
+            begin
+                changes = r.evaluate
+            rescue => detail
+                if Puppet[:trace]
+                    puts detail.backtrace
+                end
+                r.err "Failed to retrieve current state of resource : %s" % detail
+                # Mark that it failed
+                @failures[r] = 1
+                changes = []
+            end
+
+            changes = [changes] unless changes.is_a?(Array)
+            changes_not_empty = changes.length > 0
+            
+            changes.each { |c| @changes << c }
+
+            !changes_not_empty or !allow_processing?(r, changes) or has_dependencies?(r)
+        }
+
+        # push the reference resource to the list
+        resources.push(resource)
+    end
+
+    # it performs the multiple evaluation
+    def evaluate_multiple_resources(resources)
+        # Uses the first resource as the one who notified errors
+        reference_resource = resources.first
+        provider_class = reference_resource.provider.class
+
+        if resources.length > 0
+            begin
+                # Define event for each resources
+                failed_resources = provider_class.install_multiple(resources)
+
+                resources.each { |r|
+                    set_combined_resource_metrics(r, failed_resources)
+                }
+
+            rescue => detail
+                reference_resource.err "evaluate multiple resources error: %s" % detail
+
+                if Puppet[:trace]
+                    puts detail.backtrace
+                end
+
+                # All the resources failed
+                resources.each { |r|
+                    @failures[r] += 1
+                }
+
+                return nil
+            end
+        end
+    end
+    
+    # Set information about the modification applied
+    def set_combined_resource_metrics(r, failed_resources)
+        provider_class = r.provider.class
+
+        # Generate event
+        if failed_resources.include?(r)
+            r.err "Resource %s failed to evaluate" % r[:name]
+            @failures[r] += 1
+
+        else
+            if r.noop
+                r.notice "Resource %s would have been evaluated" % r[:name]
+                @combine_events[provider_class][r.name] = [Puppet::Transaction::Event.new(:noop, r)]
+
+            else
+                r.notice "Resource %s have been evaluated" % r[:name]
+                r.cache(:synced, Time.now)
+                @combine_events[provider_class][r.name] = [Puppet::Transaction::Event.new(r.name, r)]
+            end
+
+            @count += 1
+        end
+    end
+
+    def set_triggers_from_resource(resources)
+        resources.each { |r|
+            events = retrieve_combined_resource_events(r)
+            set_trigger_and_refresh(r, events)
+        }
+    end
+
     # Prepare to evaluate the resources in a transaction.
     def prepare
         # Now add any dynamically generated resources
@@ -550,6 +682,10 @@ class Transaction
             resource.warning "Skipping because of failed dependencies"
         elsif resource.virtual?
             resource.debug "Skipping because virtual"
+        elsif resource.exported?
+            resource.debug "Skipping because exported"
+        elsif failed?(resource)
+            resource.warning "Skipping because it has already failed once"
         else
             return false
         end
